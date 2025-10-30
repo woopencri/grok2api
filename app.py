@@ -19,6 +19,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
+from dotenv import load_dotenv
 
 import requests
 from flask import (
@@ -375,6 +376,7 @@ class PlaywrightStatsigManager:
 
 
 _global_statsig_manager: Optional[PlaywrightStatsigManager] = None
+_global_env_monitor: Optional[EnvFileMonitor] = None
 
 
 def initialize_statsig_manager(proxy_url: Optional[str] = None) -> None:
@@ -1113,6 +1115,79 @@ class ConfigurationManager:
         return self.data_dir
 
 
+class EnvFileMonitor:
+    """Monitor .env file changes and reload environment variables."""
+    
+    def __init__(self, env_file_path: str = ".env", check_interval: int = 5):
+        """
+        Initialize the .env file monitor.
+        
+        Args:
+            env_file_path: Path to the .env file
+            check_interval: Check interval in seconds
+        """
+        self.env_file_path = Path(env_file_path)
+        self.check_interval = check_interval
+        self.last_modified = 0
+        self.running = False
+        self.monitor_thread = None
+        self.lock = threading.Lock()
+        
+        # Load .env file initially
+        self._load_env_file()
+    
+    def _load_env_file(self):
+        """Load .env file into environment variables."""
+        if self.env_file_path.exists():
+            try:
+                load_dotenv(self.env_file_path, override=True)
+                print(f"Loaded .env file: {self.env_file_path}")
+                # Print current proxy for debugging
+                proxy = os.environ.get("PROXY")
+                if proxy:
+                    print(f"Current PROXY: {proxy}")
+                else:
+                    print("No PROXY found in .env file")
+            except Exception as e:
+                print(f"Error loading .env file: {e}")
+        else:
+            print(f".env file not found: {self.env_file_path}")
+    
+    def _monitor_loop(self):
+        """Main monitoring loop."""
+        while self.running:
+            try:
+                if self.env_file_path.exists():
+                    current_modified = self.env_file_path.stat().st_mtime
+                    
+                    with self.lock:
+                        if current_modified > self.last_modified:
+                            print(f".env file changed, reloading...")
+                            self._load_env_file()
+                            self.last_modified = current_modified
+                
+                time.sleep(self.check_interval)
+            except Exception as e:
+                print(f"Error in .env monitor: {e}")
+                time.sleep(self.check_interval)
+    
+    def start(self):
+        """Start monitoring the .env file."""
+        if not self.running:
+            self.running = True
+            self.last_modified = self.env_file_path.stat().st_mtime if self.env_file_path.exists() else 0
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitor_thread.start()
+            print(f"Started .env file monitoring (checking every {self.check_interval}s)")
+    
+    def stop(self):
+        """Stop monitoring the .env file."""
+        self.running = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=1)
+        print("Stopped .env file monitoring")
+
+
 class UtilityFunctions:
     """Collection of utility functions for common operations."""
 
@@ -1136,6 +1211,12 @@ class UtilityFunctions:
             return proxy_config
         else:
             return {"proxies": {"https": proxy_url, "http": proxy_url}}
+
+    @staticmethod
+    def get_proxy_configuration_from_env() -> Dict[str, Any]:
+        """Get proxy configuration directly from environment variables."""
+        proxy_url = os.environ.get("PROXY")
+        return UtilityFunctions.get_proxy_configuration(proxy_url)
 
     @staticmethod
     def organize_search_results(search_results: Dict[str, Any]) -> str:
@@ -2224,9 +2305,7 @@ class FileUploadManager:
             cf_clearance = self.config.get("SERVER.CF_CLEARANCE", "")
             cookie = f"{auth_token};{cf_clearance}" if cf_clearance else auth_token
 
-            proxy_config = UtilityFunctions.get_proxy_configuration(
-                self.config.get("API.PROXY")
-            )
+            proxy_config = UtilityFunctions.get_proxy_configuration_from_env()
 
             response = curl_requests.post(
                 "https://grok.com/rest/app-chat/upload-file",
@@ -2290,9 +2369,7 @@ class FileUploadManager:
             cf_clearance = self.config.get("SERVER.CF_CLEARANCE", "")
             cookie = f"{auth_token};{cf_clearance}" if cf_clearance else auth_token
 
-            proxy_config = UtilityFunctions.get_proxy_configuration(
-                self.config.get("API.PROXY")
-            )
+            proxy_config = UtilityFunctions.get_proxy_configuration_from_env()
 
             response = curl_requests.post(
                 "https://grok.com/rest/app-chat/upload-file",
@@ -2698,9 +2775,7 @@ class GrokApiClient:
         cf_clearance = self.config.get("SERVER.CF_CLEARANCE", "")
         cookie = f"{auth_token};{cf_clearance}" if cf_clearance else auth_token
 
-        proxy_config = UtilityFunctions.get_proxy_configuration(
-            self.config.get("API.PROXY")
-        )
+        proxy_config = UtilityFunctions.get_proxy_configuration_from_env()
 
         print(
             f"Making request to Grok API for model: {model} (using token pool: {token_pool})"
@@ -2991,9 +3066,7 @@ class ResponseImageHandler:
 
         while retry_count < max_retries:
             try:
-                proxy_config = UtilityFunctions.get_proxy_configuration(
-                    self.config.get("API.PROXY")
-                )
+                proxy_config = UtilityFunctions.get_proxy_configuration_from_env()
 
                 response = curl_requests.get(
                     f"https://assets.grok.com/{image_url}",
@@ -4246,7 +4319,7 @@ def initialize_application(
                 "Initialization",
             )
 
-    proxy_url = config.get("API.PROXY")
+    proxy_url = os.environ.get("PROXY")
 
     if not config.get("API.DISABLE_DYNAMIC_HEADERS", False):
         initialize_statsig_manager(proxy_url=proxy_url)
@@ -4272,7 +4345,16 @@ def initialize_application(
 
 def cleanup_resources():
     """Clean up browser resources before shutdown"""
-    global _global_statsig_manager
+    global _global_statsig_manager, _global_env_monitor
+    
+    # Stop .env file monitor
+    if _global_env_monitor:
+        try:
+            _global_env_monitor.stop()
+        except Exception as e:
+            print(f"Error stopping .env monitor: {e}")
+    
+    # Clean up browser resources
     if _global_statsig_manager:
         try:
             _global_statsig_manager.cleanup()
@@ -4283,7 +4365,12 @@ def cleanup_resources():
 
 def main():
     """Main application entry point."""
+    global _global_env_monitor
     try:
+        # Initialize .env file monitor
+        _global_env_monitor = EnvFileMonitor()
+        _global_env_monitor.start()
+        
         config = ConfigurationManager()
         token_manager = ThreadSafeTokenManager(config)
 
